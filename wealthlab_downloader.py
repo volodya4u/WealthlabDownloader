@@ -399,8 +399,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--start",
         type=parse_utc,
-        default=parse_utc("2024-01-01"),
-        help="UTC start (default: 2024-01-01).",
+        required=True,
+        help="Required UTC start, for example: 2024-01-01.",
     )
     parser.add_argument(
         "--end",

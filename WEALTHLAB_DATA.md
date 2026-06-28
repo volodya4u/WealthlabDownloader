@@ -3,7 +3,7 @@
 `wealthlab_downloader.py` downloads public Last Traded Price OHLCV bars
 for Bybit USDT linear perpetual contracts. It does not require an API key.
 
-The default start is `2024-01-01 00:00:00 UTC`. For a contract listed later,
+The start date is a required input parameter. For a contract listed later,
 the downloader automatically starts at the Bybit launch time. One symbol is
 downloaded per script run.
 
@@ -12,14 +12,14 @@ downloaded per script run.
 Download or update one symbol:
 
 ```powershell
-python .\wealthlab_downloader.py --symbol BTCUSDT
+python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01
 ```
 
 By default, an existing CSV is resumed from its final closed minute. Use
 `--force` only when you intentionally want to replace it:
 
 ```powershell
-python .\wealthlab_downloader.py --symbol BTCUSDT --force
+python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01 --force
 ```
 
 Files are written to `Bybit_1m`, one per symbol, for example:
@@ -54,7 +54,7 @@ bars for the strategy backtests.
 ## Useful options
 
 ```text
---start 2024-01-01       UTC start
+--start 2024-01-01       required UTC start
 --end 2026-01-01         exclusive UTC end
 --output-dir PATH        output directory
 --timestamp end          Wealth-Lab convention (default)
