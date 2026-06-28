@@ -36,8 +36,10 @@ invalid interval before making an API request and displays the valid options.
 The downloader validates every command-line parameter and exits with a clear
 error instead of starting a download when an input is invalid:
 
-- `--symbol` must have the form `ETHUSDT` or `BYBIT:ETHUSDT.P`. The program
-  then asks Bybit to confirm that it is an active USDT linear perpetual.
+- `--symbol` must have the form `ETHUSDT`, `1000PEPEUSDT`, or a TradingView
+  form such as `BYBIT:1000PEPEUSDT.P`. Numeric prefixes such as `1000` are
+  accepted. The program then asks Bybit to confirm that it is an active USDT
+  linear perpetual.
 - `--start` and `--end` must be real calendar dates in `YYYY-MM-DD` or
   ISO-8601 format. Future dates are rejected.
 - `--start` must precede `--end`, and the range must contain at least one

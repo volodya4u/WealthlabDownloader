@@ -176,7 +176,7 @@ def normalize_symbol(value: str) -> str:
     if not re.fullmatch(r"[A-Z0-9]+USDT", symbol) or not symbol[:-4]:
         raise argparse.ArgumentTypeError(
             f"invalid currency pair {value!r}. Expected a Bybit USDT perpetual "
-            "symbol such as ETHUSDT or BYBIT:ETHUSDT.P"
+            "symbol such as ETHUSDT, 1000PEPEUSDT, or BYBIT:1000PEPEUSDT.P"
         )
     return symbol
 
@@ -529,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=normalize_symbol,
         help=(
             "One Bybit symbol to download. TradingView forms such as "
-            "BYBIT:BTCUSDT.P are accepted."
+            "BYBIT:BTCUSDT.P and 1000PEPEUSDT.P are accepted."
         ),
     )
     parser.add_argument(
