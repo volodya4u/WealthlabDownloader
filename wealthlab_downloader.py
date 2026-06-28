@@ -55,8 +55,78 @@ class DownloadResult:
     resumed: bool
 
 
-def floor_to_minute_ms(value_ms: int) -> int:
-    return value_ms - value_ms % ONE_MINUTE_MS
+@dataclass(frozen=True)
+class IntervalSpec:
+    label: str
+    api_value: str
+    duration_ms: int | None
+
+
+SUPPORTED_INTERVALS = (
+    IntervalSpec("1m", "1", ONE_MINUTE_MS),
+    IntervalSpec("3m", "3", 3 * ONE_MINUTE_MS),
+    IntervalSpec("5m", "5", 5 * ONE_MINUTE_MS),
+    IntervalSpec("15m", "15", 15 * ONE_MINUTE_MS),
+    IntervalSpec("30m", "30", 30 * ONE_MINUTE_MS),
+    IntervalSpec("1h", "60", 60 * ONE_MINUTE_MS),
+    IntervalSpec("2h", "120", 120 * ONE_MINUTE_MS),
+    IntervalSpec("4h", "240", 240 * ONE_MINUTE_MS),
+    IntervalSpec("6h", "360", 360 * ONE_MINUTE_MS),
+    IntervalSpec("12h", "720", 720 * ONE_MINUTE_MS),
+    IntervalSpec("1d", "D", 24 * 60 * ONE_MINUTE_MS),
+    IntervalSpec("1w", "W", 7 * 24 * 60 * ONE_MINUTE_MS),
+    IntervalSpec("1M", "M", None),
+)
+INTERVALS_BY_LABEL = {interval.label: interval for interval in SUPPORTED_INTERVALS}
+INTERVAL_HINT = ", ".join(interval.label for interval in SUPPORTED_INTERVALS)
+
+
+def parse_interval(value: str) -> IntervalSpec:
+    text = value.strip()
+    key = text if text == "1M" else text.lower()
+    interval = INTERVALS_BY_LABEL.get(key)
+    if interval is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid interval {value!r}. Supported Bybit intervals: {INTERVAL_HINT}"
+        )
+    return interval
+
+
+def floor_to_interval_ms(value_ms: int, interval: IntervalSpec) -> int:
+    dt = datetime.fromtimestamp(value_ms / 1_000, tz=timezone.utc)
+    if interval.label == "1M":
+        return int(datetime(dt.year, dt.month, 1, tzinfo=timezone.utc).timestamp() * 1_000)
+    if interval.label == "1w":
+        day_start = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+        monday = day_start.timestamp() * 1_000 - dt.weekday() * 24 * 60 * ONE_MINUTE_MS
+        return int(monday)
+    assert interval.duration_ms is not None
+    return value_ms - value_ms % interval.duration_ms
+
+
+def advance_intervals_ms(value_ms: int, interval: IntervalSpec, count: int) -> int:
+    if count < 0:
+        raise ValueError("count cannot be negative")
+    if interval.label != "1M":
+        assert interval.duration_ms is not None
+        return value_ms + interval.duration_ms * count
+
+    dt = datetime.fromtimestamp(value_ms / 1_000, tz=timezone.utc)
+    month_index = dt.year * 12 + (dt.month - 1) + count
+    year, month_zero_based = divmod(month_index, 12)
+    result = datetime(year, month_zero_based + 1, 1, tzinfo=timezone.utc)
+    return int(result.timestamp() * 1_000)
+
+
+def interval_count_between(start_ms: int, end_ms: int, interval: IntervalSpec) -> int:
+    if end_ms <= start_ms:
+        return 0
+    if interval.label != "1M":
+        assert interval.duration_ms is not None
+        return (end_ms - start_ms) // interval.duration_ms
+    start = datetime.fromtimestamp(start_ms / 1_000, tz=timezone.utc)
+    end = datetime.fromtimestamp(end_ms / 1_000, tz=timezone.utc)
+    return max(0, (end.year - start.year) * 12 + end.month - start.month)
 
 
 def utc_now_ms() -> int:
@@ -83,10 +153,12 @@ def parse_utc(value: str) -> int:
     return int(dt.timestamp() * 1_000)
 
 
-def format_wealthlab_datetime(start_time_ms: int, timestamp_mode: str) -> str:
+def format_wealthlab_datetime(
+    start_time_ms: int, timestamp_mode: str, interval: IntervalSpec
+) -> str:
     timestamp_ms = start_time_ms
     if timestamp_mode == "end":
-        timestamp_ms += ONE_MINUTE_MS
+        timestamp_ms = advance_intervals_ms(start_time_ms, interval, 1)
     dt = datetime.fromtimestamp(timestamp_ms / 1_000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -115,7 +187,7 @@ def api_get(
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "WealthLab-Bybit-1m-Downloader/1.0",
+            "User-Agent": "WealthLab-Bybit-History-Downloader/1.0",
         },
     )
 
@@ -182,6 +254,7 @@ def get_klines(
     symbol: str,
     start_ms: int,
     end_exclusive_ms: int,
+    interval: IntervalSpec,
     *,
     timeout_seconds: float,
     retries: int,
@@ -193,7 +266,7 @@ def get_klines(
         {
             "category": "linear",
             "symbol": symbol,
-            "interval": "1",
+            "interval": interval.api_value,
             "start": start_ms,
             "end": end_exclusive_ms - 1,
             "limit": MAX_BARS_PER_REQUEST,
@@ -266,7 +339,9 @@ def validate_or_create_csv(path: Path, *, force: bool) -> bool:
     return read_last_csv_row(path) is not None
 
 
-def resume_start_ms(path: Path, timestamp_mode: str) -> int | None:
+def resume_start_ms(
+    path: Path, timestamp_mode: str, interval: IntervalSpec
+) -> int | None:
     row = read_last_csv_row(path)
     if row is None:
         return None
@@ -279,19 +354,28 @@ def resume_start_ms(path: Path, timestamp_mode: str) -> int | None:
     except ValueError as exc:
         raise DownloadError(f"{path}: invalid last DateTime value {row[0]!r}") from exc
     value_ms = int(timestamp.timestamp() * 1_000)
-    # End-of-bar 00:01 means that the next bar starts at 00:01. With
-    # start-of-bar timestamps, the next bar starts one minute later.
+    # With an end-of-bar timestamp, the next bar starts at that timestamp.
+    # With a start-of-bar timestamp, advance by one selected interval.
     if timestamp_mode == "start":
-        value_ms += ONE_MINUTE_MS
+        value_ms = advance_intervals_ms(value_ms, interval, 1)
     return value_ms
 
 
-def count_gaps(rows: Iterable[Kline], previous_start_ms: int | None) -> tuple[int, int | None]:
+def count_gaps(
+    rows: Iterable[Kline],
+    previous_start_ms: int | None,
+    interval: IntervalSpec,
+) -> tuple[int, int | None]:
     gaps = 0
     previous = previous_start_ms
     for row in rows:
-        if previous is not None and row.start_time_ms > previous + ONE_MINUTE_MS:
-            gaps += (row.start_time_ms - previous) // ONE_MINUTE_MS - 1
+        if previous is not None:
+            expected = advance_intervals_ms(previous, interval, 1)
+            if row.start_time_ms > expected:
+                gaps += max(
+                    0,
+                    interval_count_between(previous, row.start_time_ms, interval) - 1,
+                )
         previous = row.start_time_ms
     return gaps, previous
 
@@ -301,6 +385,7 @@ def download_symbol(
     requested_start_ms: int,
     end_exclusive_ms: int,
     output_dir: Path,
+    interval: IntervalSpec,
     *,
     timestamp_mode: str,
     force: bool,
@@ -311,12 +396,12 @@ def download_symbol(
     instrument = get_instrument(
         symbol, timeout_seconds=timeout_seconds, retries=retries
     )
-    path = output_dir / f"{symbol}.csv"
+    path = output_dir / f"{symbol}_{interval.label}.csv"
     resumed = validate_or_create_csv(path, force=force)
 
-    launch_ms = floor_to_minute_ms(instrument.launch_time_ms)
+    launch_ms = floor_to_interval_ms(instrument.launch_time_ms, interval)
     effective_start_ms = max(requested_start_ms, launch_ms)
-    existing_next_ms = resume_start_ms(path, timestamp_mode)
+    existing_next_ms = resume_start_ms(path, timestamp_mode, interval)
     if existing_next_ms is not None:
         effective_start_ms = max(effective_start_ms, existing_next_ms)
 
@@ -324,37 +409,45 @@ def download_symbol(
         print(f"{symbol}: already up to date -> {path}")
         return DownloadResult(symbol, path, 0, 0, resumed)
 
-    total_minutes = (end_exclusive_ms - effective_start_ms) // ONE_MINUTE_MS
+    total_bars = interval_count_between(
+        effective_start_ms, end_exclusive_ms, interval
+    )
     cursor_ms = effective_start_ms
     rows_written = 0
     gaps_detected = 0
     previous_start_ms: int | None = None
     chunk_number = 0
     print(
-        f"{symbol}: downloading {total_minutes:,} closed 1m bars "
-        f"from {format_wealthlab_datetime(effective_start_ms, 'start')} UTC"
+        f"{symbol}: downloading approximately {total_bars:,} closed "
+        f"{interval.label} bars from "
+        f"{format_wealthlab_datetime(effective_start_ms, 'start', interval)} UTC"
     )
 
     with path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         while cursor_ms < end_exclusive_ms:
             window_end_ms = min(
-                cursor_ms + MAX_BARS_PER_REQUEST * ONE_MINUTE_MS,
+                advance_intervals_ms(cursor_ms, interval, MAX_BARS_PER_REQUEST),
                 end_exclusive_ms,
             )
             klines = get_klines(
                 symbol,
                 cursor_ms,
                 window_end_ms,
+                interval,
                 timeout_seconds=timeout_seconds,
                 retries=retries,
             )
-            chunk_gaps, previous_start_ms = count_gaps(klines, previous_start_ms)
+            chunk_gaps, previous_start_ms = count_gaps(
+                klines, previous_start_ms, interval
+            )
             gaps_detected += chunk_gaps
             for bar in klines:
                 writer.writerow(
                     (
-                        format_wealthlab_datetime(bar.start_time_ms, timestamp_mode),
+                        format_wealthlab_datetime(
+                            bar.start_time_ms, timestamp_mode, interval
+                        ),
                         bar.open,
                         bar.high,
                         bar.low,
@@ -372,7 +465,7 @@ def download_symbol(
                 print(
                     f"{symbol}: {completed:6.2f}% | "
                     f"{rows_written:,} rows | "
-                    f"through {format_wealthlab_datetime(cursor_ms, 'start')} UTC"
+                    f"through {format_wealthlab_datetime(cursor_ms, 'start', interval)} UTC"
                 )
             if pause_seconds > 0 and cursor_ms < end_exclusive_ms:
                 time.sleep(pause_seconds)
@@ -383,7 +476,7 @@ def download_symbol(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Download closed 1-minute Last Traded Price candles for Bybit USDT "
+            "Download closed Last Traded Price candles for Bybit USDT "
             "linear perpetuals and save Wealth-Lab-compatible CSV files."
         )
     )
@@ -394,6 +487,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One Bybit symbol to download. TradingView forms such as "
             "BYBIT:BTCUSDT.P are accepted."
+        ),
+    )
+    parser.add_argument(
+        "--interval",
+        type=parse_interval,
+        default=INTERVALS_BY_LABEL["1m"],
+        metavar="INTERVAL",
+        help=(
+            "Candle interval (default: 1m). Supported: "
+            f"{INTERVAL_HINT}."
         ),
     )
     parser.add_argument(
@@ -413,8 +516,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("Bybit_1m"),
-        help="Output directory (default: ./Bybit_1m).",
+        default=Path("Bybit_data"),
+        help="Output directory (default: ./Bybit_data).",
     )
     parser.add_argument(
         "--timestamp",
@@ -466,10 +569,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     symbol = args.symbol
+    interval = args.interval
     end_exclusive_ms = (
-        floor_to_minute_ms(utc_now_ms()) if args.end is None else floor_to_minute_ms(args.end)
+        floor_to_interval_ms(utc_now_ms(), interval)
+        if args.end is None
+        else floor_to_interval_ms(args.end, interval)
     )
-    start_ms = floor_to_minute_ms(args.start)
+    start_ms = floor_to_interval_ms(args.start, interval)
 
     if start_ms >= end_exclusive_ms:
         parser.error("--start must be earlier than --end/current closed minute")
@@ -482,6 +588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("Bybit source: linear USDT perpetual Last Traded Price klines")
     print(f"Symbol: {symbol}")
+    print(f"Interval: {interval.label} (Bybit API value: {interval.api_value})")
     print(f"Output: {args.output_dir.resolve()}")
     print(f"Timestamp convention: {args.timestamp}-of-bar UTC")
 
@@ -491,6 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             start_ms,
             end_exclusive_ms,
             args.output_dir,
+            interval,
             timestamp_mode=args.timestamp,
             force=args.force,
             timeout_seconds=args.timeout,
@@ -503,7 +611,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"{symbol}: done | {result.rows_written:,} new rows | "
-        f"{result.gaps_detected:,} missing minute(s) detected | {result.path}"
+        f"{result.gaps_detected:,} missing {interval.label} interval(s) detected | "
+        f"{result.path}"
     )
     return 0
 

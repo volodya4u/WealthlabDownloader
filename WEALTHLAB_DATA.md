@@ -1,4 +1,4 @@
-# Bybit 1-minute data for Wealth-Lab
+# Bybit historical data for Wealth-Lab
 
 `wealthlab_downloader.py` downloads public Last Traded Price OHLCV bars
 for Bybit USDT linear perpetual contracts. It does not require an API key.
@@ -15,6 +15,22 @@ Download or update one symbol:
 python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01
 ```
 
+The default interval is `1m`. Select another supported interval with
+`--interval`:
+
+```powershell
+python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01 --interval 1h
+```
+
+Supported Bybit intervals:
+
+```text
+1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M
+```
+
+Values such as `10m` are not supported by Bybit. The script rejects an
+invalid interval before making an API request and displays the valid options.
+
 By default, an existing CSV is resumed from its final closed minute. Use
 `--force` only when you intentionally want to replace it:
 
@@ -22,10 +38,11 @@ By default, an existing CSV is resumed from its final closed minute. Use
 python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01 --force
 ```
 
-Files are written to `Bybit_1m`, one per symbol, for example:
+Files are written to `Bybit_data`, with the interval in the filename:
 
 ```text
-Bybit_1m\BTCUSDT.csv
+Bybit_data\BTCUSDT_1m.csv
+Bybit_data\BTCUSDT_1h.csv
 ```
 
 ## Wealth-Lab ASCII DataSet
@@ -38,7 +55,7 @@ DateTime, Open, High, Low, Close, Volume
 
 Use:
 
-- Scale: `1 Minute`
+- Scale: the same interval selected with `--interval`
 - Time zone: `UTC`
 - Market hours: `24/7`
 - Holidays: none
@@ -48,13 +65,14 @@ The CSV timestamps are already converted from Bybit's start-of-bar timestamp
 to Wealth-Lab's end-of-bar convention. Therefore, leave Wealth-Lab's
 `Adjust bar timestamps from start-of-bar to end-of-bar` option **unchecked**.
 
-Wealth-Lab can then compress the 1-minute history to 60-minute or 120-minute
-bars for the strategy backtests.
+With the default `1m` data, Wealth-Lab can compress the history to 60-minute
+or 120-minute bars for the strategy backtests.
 
 ## Useful options
 
 ```text
 --start 2024-01-01       required UTC start
+--interval 1m            candle interval (default: 1m)
 --end 2026-01-01         exclusive UTC end
 --output-dir PATH        output directory
 --timestamp end          Wealth-Lab convention (default)
@@ -66,5 +84,5 @@ bars for the strategy backtests.
 
 Only fully closed candles are downloaded. The script validates that every
 symbol is an active `LinearPerpetual` quoted and settled in USDT, removes
-duplicates returned by the API, and reports missing one-minute intervals
+duplicates returned by the API, and reports missing selected intervals
 without inventing synthetic candles.
