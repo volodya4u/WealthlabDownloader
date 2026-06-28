@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import re
 import sys
 import time
 import urllib.error
@@ -146,11 +148,13 @@ def parse_utc(value: str) -> int:
                 dt = dt.replace(tzinfo=timezone.utc)
             else:
                 dt = dt.astimezone(timezone.utc)
-    except ValueError as exc:
+        timestamp_ms = int(dt.timestamp() * 1_000)
+    except (ValueError, OverflowError, OSError) as exc:
         raise argparse.ArgumentTypeError(
-            f"invalid date/time {value!r}; use YYYY-MM-DD or ISO-8601"
+            f"invalid date/time {value!r}. Use YYYY-MM-DD or ISO-8601, "
+            "for example 2024-01-01 or 2024-01-01T12:30:00Z"
         ) from exc
-    return int(dt.timestamp() * 1_000)
+    return timestamp_ms
 
 
 def format_wealthlab_datetime(
@@ -169,9 +173,42 @@ def normalize_symbol(value: str) -> str:
         symbol = symbol[6:]
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
-    if not symbol or not symbol.replace("-", "").isalnum():
-        raise argparse.ArgumentTypeError(f"invalid Bybit symbol: {value!r}")
+    if not re.fullmatch(r"[A-Z0-9]+USDT", symbol) or not symbol[:-4]:
+        raise argparse.ArgumentTypeError(
+            f"invalid currency pair {value!r}. Expected a Bybit USDT perpetual "
+            "symbol such as ETHUSDT or BYBIT:ETHUSDT.P"
+        )
     return symbol
+
+
+def parse_positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return number
+
+
+def parse_nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative finite number")
+    return number
+
+
+def parse_nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("value cannot be negative")
+    return number
 
 
 def api_get(
@@ -226,7 +263,10 @@ def get_instrument(
     items = payload.get("result", {}).get("list", [])
     exact = next((item for item in items if item.get("symbol") == symbol), None)
     if exact is None:
-        raise DownloadError(f"{symbol}: linear instrument not found on Bybit")
+        raise DownloadError(
+            f"invalid currency pair {symbol!r}: an active Bybit USDT linear "
+            "perpetual contract was not found"
+        )
 
     instrument = Instrument(
         symbol=str(exact.get("symbol", "")),
@@ -237,7 +277,10 @@ def get_instrument(
         launch_time_ms=int(exact.get("launchTime", 0)),
     )
     if instrument.status != "Trading":
-        raise DownloadError(f"{symbol}: instrument status is {instrument.status!r}")
+        raise DownloadError(
+            f"currency pair {symbol!r} is not currently tradable on Bybit "
+            f"(status: {instrument.status!r})"
+        )
     if instrument.contract_type != "LinearPerpetual":
         raise DownloadError(
             f"{symbol}: expected LinearPerpetual, got {instrument.contract_type!r}"
@@ -535,19 +578,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=parse_positive_float,
         default=30.0,
         help="HTTP timeout in seconds (default: 30).",
     )
     parser.add_argument(
         "--retries",
-        type=int,
+        type=parse_nonnegative_int,
         default=5,
         help="Retries after transient API/network errors (default: 5).",
     )
     parser.add_argument(
         "--pause",
-        type=float,
+        type=parse_nonnegative_float,
         default=0.05,
         help="Pause between Kline requests in seconds (default: 0.05).",
     )
@@ -570,21 +613,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     symbol = args.symbol
     interval = args.interval
+    now_ms = utc_now_ms()
+
+    if args.start >= now_ms:
+        parser.error("--start cannot be in the future")
+    if args.end is not None and args.end > now_ms:
+        parser.error("--end cannot be in the future")
+
     end_exclusive_ms = (
-        floor_to_interval_ms(utc_now_ms(), interval)
+        floor_to_interval_ms(now_ms, interval)
         if args.end is None
         else floor_to_interval_ms(args.end, interval)
     )
     start_ms = floor_to_interval_ms(args.start, interval)
 
     if start_ms >= end_exclusive_ms:
-        parser.error("--start must be earlier than --end/current closed minute")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
-    if args.retries < 0:
-        parser.error("--retries cannot be negative")
-    if args.pause < 0:
-        parser.error("--pause cannot be negative")
+        parser.error(
+            f"--start must be earlier than --end and the range must contain "
+            f"at least one complete {interval.label} candle"
+        )
+    if args.output_dir.exists() and not args.output_dir.is_dir():
+        parser.error(f"--output-dir is not a directory: {args.output_dir}")
 
     print("Bybit source: linear USDT perpetual Last Traded Price klines")
     print(f"Symbol: {symbol}")

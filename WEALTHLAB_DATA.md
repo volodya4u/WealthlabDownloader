@@ -31,6 +31,24 @@ Supported Bybit intervals:
 Values such as `10m` are not supported by Bybit. The script rejects an
 invalid interval before making an API request and displays the valid options.
 
+## Input validation
+
+The downloader validates every command-line parameter and exits with a clear
+error instead of starting a download when an input is invalid:
+
+- `--symbol` must have the form `ETHUSDT` or `BYBIT:ETHUSDT.P`. The program
+  then asks Bybit to confirm that it is an active USDT linear perpetual.
+- `--start` and `--end` must be real calendar dates in `YYYY-MM-DD` or
+  ISO-8601 format. Future dates are rejected.
+- `--start` must precede `--end`, and the range must contain at least one
+  complete candle of the selected interval.
+- `--interval` and `--timestamp` accept only the documented choices.
+- `--timeout` must be positive; `--retries` and `--pause` cannot be negative.
+- An existing `--output-dir` path must be a directory.
+
+For example, `ETHUSDC`, `ETH/USD`, `2024-02-30`, a future date, or an unknown
+Bybit pair will produce an error message and no candle download will begin.
+
 By default, an existing CSV is resumed from its final closed minute. Use
 `--force` only when you intentionally want to replace it:
 
