@@ -4,12 +4,14 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +64,13 @@ class IntervalSpec:
     label: str
     api_value: str
     duration_ms: int | None
+
+
+@dataclass(frozen=True)
+class CsvAudit:
+    rows: int
+    first_timestamp_ms: int | None
+    last_timestamp_ms: int | None
 
 
 SUPPORTED_INTERVALS = (
@@ -341,67 +350,196 @@ def get_klines(
     return [rows[key] for key in sorted(rows)]
 
 
-def read_last_csv_row(path: Path) -> list[str] | None:
-    if not path.exists() or path.stat().st_size == 0:
-        return None
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        end = handle.tell()
-        block_size = 8_192
-        data = b""
-        position = end
-        while position > 0 and data.count(b"\n") < 2:
-            take = min(block_size, position)
-            position -= take
-            handle.seek(position)
-            data = handle.read(take) + data
-    lines = [line for line in data.decode("utf-8-sig").splitlines() if line.strip()]
-    if not lines:
-        return None
-    row = next(csv.reader([lines[-1]]))
-    if tuple(row) == CSV_HEADER:
-        return None
-    return row
-
-
-def validate_or_create_csv(path: Path, *, force: bool) -> bool:
+def create_csv(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if force and path.exists():
-        path.unlink()
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle, lineterminator="\n").writerow(CSV_HEADER)
+
+
+def parse_csv_timestamp(path: Path, line_number: int, value: str) -> int:
+    try:
+        if (
+            len(value) != 19
+            or value[4] != "-"
+            or value[7] != "-"
+            or value[10] != " "
+            or value[13] != ":"
+            or value[16] != ":"
+        ):
+            raise ValueError("unexpected DateTime format")
+        timestamp = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+        return int(timestamp.timestamp() * 1_000)
+    except (ValueError, OverflowError, OSError) as exc:
+        raise DownloadError(
+            f"{path}: line {line_number} has invalid DateTime {value!r}"
+        ) from exc
+
+
+def validate_ohlcv(path: Path, line_number: int, row: list[str]) -> None:
+    try:
+        open_price, high, low, close, volume = (float(value) for value in row[1:])
+    except (ValueError, OverflowError) as exc:
+        raise DownloadError(
+            f"{path}: line {line_number} contains a non-numeric OHLCV value"
+        ) from exc
+
+    values = (open_price, high, low, close, volume)
+    if not all(math.isfinite(value) for value in values):
+        raise DownloadError(
+            f"{path}: line {line_number} contains a non-finite OHLCV value"
+        )
+    if min(open_price, high, low, close) <= 0 or volume < 0:
+        raise DownloadError(
+            f"{path}: line {line_number} contains an invalid price or volume"
+        )
+    if high < max(open_price, low, close) or low > min(open_price, high, close):
+        raise DownloadError(
+            f"{path}: line {line_number} has inconsistent OHLC values"
+        )
+
+
+def audit_csv(path: Path, interval: IntervalSpec) -> CsvAudit:
     if not path.exists() or path.stat().st_size == 0:
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            csv.writer(handle, lineterminator="\n").writerow(CSV_HEADER)
-        return False
+        raise DownloadError(f"{path}: CSV is empty")
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        header = next(csv.reader(handle), None)
-    if tuple(header or ()) != CSV_HEADER:
-        raise DownloadError(
-            f"{path}: unexpected CSV header {header!r}; expected {list(CSV_HEADER)!r}"
-        )
-    return read_last_csv_row(path) is not None
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if tuple(header or ()) != CSV_HEADER:
+            raise DownloadError(
+                f"{path}: unexpected CSV header {header!r}; "
+                f"expected {list(CSV_HEADER)!r}"
+            )
+
+        rows = 0
+        first_timestamp_ms: int | None = None
+        previous_timestamp_ms: int | None = None
+        for line_number, row in enumerate(reader, start=2):
+            if len(row) != len(CSV_HEADER):
+                raise DownloadError(
+                    f"{path}: line {line_number} has {len(row)} columns; "
+                    f"expected {len(CSV_HEADER)}"
+                )
+            timestamp_ms = parse_csv_timestamp(path, line_number, row[0])
+            if floor_to_interval_ms(timestamp_ms, interval) != timestamp_ms:
+                raise DownloadError(
+                    f"{path}: line {line_number} timestamp {row[0]!r} is not "
+                    f"aligned to {interval.label}"
+                )
+            if previous_timestamp_ms is not None:
+                expected_ms = advance_intervals_ms(
+                    previous_timestamp_ms, interval, 1
+                )
+                if timestamp_ms != expected_ms:
+                    previous_text = format_wealthlab_datetime(
+                        previous_timestamp_ms, "start", interval
+                    )
+                    if timestamp_ms == previous_timestamp_ms:
+                        problem = "duplicate candle"
+                    elif timestamp_ms < expected_ms:
+                        problem = "out-of-order candle"
+                    else:
+                        missing = interval_count_between(
+                            expected_ms, timestamp_ms, interval
+                        )
+                        problem = f"{missing} missing {interval.label} candle(s)"
+                    raise DownloadError(
+                        f"{path}: line {line_number} has {problem} between "
+                        f"{previous_text!r} and {row[0]!r}"
+                    )
+            validate_ohlcv(path, line_number, row)
+            if first_timestamp_ms is None:
+                first_timestamp_ms = timestamp_ms
+            previous_timestamp_ms = timestamp_ms
+            rows += 1
+
+    return CsvAudit(rows, first_timestamp_ms, previous_timestamp_ms)
+
+
+def prepare_csv(
+    path: Path, interval: IntervalSpec, *, force: bool
+) -> tuple[CsvAudit, bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if force:
+        create_csv(path)
+        return CsvAudit(0, None, None), False
+
+    if not path.exists() or path.stat().st_size == 0:
+        create_csv(path)
+        return CsvAudit(0, None, None), False
+
+    print(f"{path.name}: validating existing CSV before resume...")
+    try:
+        audit = audit_csv(path, interval)
+    except (DownloadError, OSError, UnicodeError, csv.Error) as exc:
+        print(f"{path.name}: CORRUPTED: {exc}", file=sys.stderr)
+        print(f"{path.name}: replacing it and restarting the download from scratch")
+        create_csv(path)
+        return CsvAudit(0, None, None), False
+
+    print(f"{path.name}: integrity check passed ({audit.rows:,} rows)")
+    return audit, audit.rows > 0
 
 
 def resume_start_ms(
-    path: Path, timestamp_mode: str, interval: IntervalSpec
+    audit: CsvAudit, timestamp_mode: str, interval: IntervalSpec
 ) -> int | None:
-    row = read_last_csv_row(path)
-    if row is None:
+    if audit.last_timestamp_ms is None:
         return None
-    if len(row) != len(CSV_HEADER):
-        raise DownloadError(f"{path}: malformed last CSV row: {row!r}")
-    try:
-        timestamp = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc
-        )
-    except ValueError as exc:
-        raise DownloadError(f"{path}: invalid last DateTime value {row[0]!r}") from exc
-    value_ms = int(timestamp.timestamp() * 1_000)
+    value_ms = audit.last_timestamp_ms
     # With an end-of-bar timestamp, the next bar starts at that timestamp.
     # With a start-of-bar timestamp, advance by one selected interval.
     if timestamp_mode == "start":
         value_ms = advance_intervals_ms(value_ms, interval, 1)
     return value_ms
+
+
+@contextmanager
+def lock_csv(path: Path) -> Iterable[None]:
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        if lock_path.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise DownloadError(
+                f"{path}: another downloader process is already using this CSV"
+            ) from exc
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+        if acquired:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
 
 
 def count_gaps(
@@ -423,12 +561,14 @@ def count_gaps(
     return gaps, previous
 
 
-def download_symbol(
+def _download_symbol_locked(
     symbol: str,
     requested_start_ms: int,
     end_exclusive_ms: int,
     output_dir: Path,
     interval: IntervalSpec,
+    instrument: Instrument,
+    path: Path,
     *,
     timestamp_mode: str,
     force: bool,
@@ -436,15 +576,11 @@ def download_symbol(
     retries: int,
     pause_seconds: float,
 ) -> DownloadResult:
-    instrument = get_instrument(
-        symbol, timeout_seconds=timeout_seconds, retries=retries
-    )
-    path = output_dir / f"{symbol}_{interval.label}.csv"
-    resumed = validate_or_create_csv(path, force=force)
+    audit, resumed = prepare_csv(path, interval, force=force)
 
     launch_ms = floor_to_interval_ms(instrument.launch_time_ms, interval)
     effective_start_ms = max(requested_start_ms, launch_ms)
-    existing_next_ms = resume_start_ms(path, timestamp_mode, interval)
+    existing_next_ms = resume_start_ms(audit, timestamp_mode, interval)
     if existing_next_ms is not None:
         effective_start_ms = max(effective_start_ms, existing_next_ms)
 
@@ -513,7 +649,52 @@ def download_symbol(
             if pause_seconds > 0 and cursor_ms < end_exclusive_ms:
                 time.sleep(pause_seconds)
 
+    print(f"{path.name}: validating completed CSV...")
+    try:
+        final_audit = audit_csv(path, interval)
+    except (DownloadError, OSError, UnicodeError, csv.Error) as exc:
+        raise DownloadError(
+            f"{path}: completed CSV failed its integrity check: {exc}"
+        ) from exc
+    print(
+        f"{path.name}: completed integrity check passed "
+        f"({final_audit.rows:,} rows)"
+    )
     return DownloadResult(symbol, path, rows_written, gaps_detected, resumed)
+
+
+def download_symbol(
+    symbol: str,
+    requested_start_ms: int,
+    end_exclusive_ms: int,
+    output_dir: Path,
+    interval: IntervalSpec,
+    *,
+    timestamp_mode: str,
+    force: bool,
+    timeout_seconds: float,
+    retries: int,
+    pause_seconds: float,
+) -> DownloadResult:
+    instrument = get_instrument(
+        symbol, timeout_seconds=timeout_seconds, retries=retries
+    )
+    path = output_dir / f"{symbol}_{interval.label}.csv"
+    with lock_csv(path):
+        return _download_symbol_locked(
+            symbol,
+            requested_start_ms,
+            end_exclusive_ms,
+            output_dir,
+            interval,
+            instrument,
+            path,
+            timestamp_mode=timestamp_mode,
+            force=force,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            pause_seconds=pause_seconds,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

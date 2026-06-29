@@ -58,6 +58,19 @@ By default, an existing CSV is resumed from its final closed minute. Use
 python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01 --force
 ```
 
+Before resuming, the downloader performs a full integrity scan of the existing
+CSV. It verifies the header, six columns per row, timestamp format and interval
+alignment, uninterrupted chronological candles without gaps or duplicates,
+and valid OHLCV values. If the file is malformed, contains a missing candle,
+or has out-of-order/duplicate timestamps, its contents are automatically
+replaced with a clean CSV and the symbol is downloaded again from the requested
+start date.
+
+The completed CSV is scanned again after downloading. A per-file lock also
+prevents two downloader processes from writing the same symbol and interval at
+the same time. A second process exits with a clear error instead of risking a
+corrupted CSV.
+
 Files are written to `Bybit_data`, with the interval in the filename:
 
 ```text
