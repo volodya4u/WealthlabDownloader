@@ -261,20 +261,29 @@ def api_get(
 
 
 def get_instrument(
-    symbol: str, *, timeout_seconds: float, retries: int
+    symbol: str,
+    category: str,
+    *,
+    timeout_seconds: float,
+    retries: int,
 ) -> Instrument:
     payload = api_get(
         INSTRUMENT_PATH,
-        {"category": "linear", "symbol": symbol},
+        {"category": category, "symbol": symbol},
         timeout_seconds=timeout_seconds,
         retries=retries,
     )
     items = payload.get("result", {}).get("list", [])
     exact = next((item for item in items if item.get("symbol") == symbol), None)
     if exact is None:
+        product = (
+            "USDT linear perpetual contract"
+            if category == "linear"
+            else "USDT spot market"
+        )
         raise DownloadError(
-            f"invalid currency pair {symbol!r}: an active Bybit USDT linear "
-            "perpetual contract was not found"
+            f"invalid currency pair {symbol!r}: an active Bybit {product} "
+            "was not found"
         )
 
     instrument = Instrument(
@@ -283,27 +292,35 @@ def get_instrument(
         contract_type=str(exact.get("contractType", "")),
         quote_coin=str(exact.get("quoteCoin", "")),
         settle_coin=str(exact.get("settleCoin", "")),
-        launch_time_ms=int(exact.get("launchTime", 0)),
+        launch_time_ms=int(exact.get("launchTime") or 0),
     )
     if instrument.status != "Trading":
         raise DownloadError(
             f"currency pair {symbol!r} is not currently tradable on Bybit "
             f"(status: {instrument.status!r})"
         )
-    if instrument.contract_type != "LinearPerpetual":
+    if category == "linear":
+        if instrument.contract_type != "LinearPerpetual":
+            raise DownloadError(
+                f"{symbol}: expected LinearPerpetual, "
+                f"got {instrument.contract_type!r}"
+            )
+        if instrument.quote_coin != "USDT" or instrument.settle_coin != "USDT":
+            raise DownloadError(
+                f"{symbol}: expected USDT quote/settlement, got "
+                f"{instrument.quote_coin}/{instrument.settle_coin}"
+            )
+    elif instrument.quote_coin != "USDT":
         raise DownloadError(
-            f"{symbol}: expected LinearPerpetual, got {instrument.contract_type!r}"
-        )
-    if instrument.quote_coin != "USDT" or instrument.settle_coin != "USDT":
-        raise DownloadError(
-            f"{symbol}: expected USDT quote/settlement, got "
-            f"{instrument.quote_coin}/{instrument.settle_coin}"
+            f"{symbol}: expected a USDT spot quote, got "
+            f"{instrument.quote_coin!r}"
         )
     return instrument
 
 
 def get_klines(
     symbol: str,
+    category: str,
     start_ms: int,
     end_exclusive_ms: int,
     interval: IntervalSpec,
@@ -316,7 +333,7 @@ def get_klines(
     payload = api_get(
         KLINE_PATH,
         {
-            "category": "linear",
+            "category": category,
             "symbol": symbol,
             "interval": interval.api_value,
             "start": start_ms,
@@ -563,6 +580,7 @@ def count_gaps(
 
 def _download_symbol_locked(
     symbol: str,
+    category: str,
     requested_start_ms: int,
     end_exclusive_ms: int,
     output_dir: Path,
@@ -611,6 +629,7 @@ def _download_symbol_locked(
             )
             klines = get_klines(
                 symbol,
+                category,
                 cursor_ms,
                 window_end_ms,
                 interval,
@@ -665,6 +684,7 @@ def _download_symbol_locked(
 
 def download_symbol(
     symbol: str,
+    category: str,
     requested_start_ms: int,
     end_exclusive_ms: int,
     output_dir: Path,
@@ -677,12 +697,16 @@ def download_symbol(
     pause_seconds: float,
 ) -> DownloadResult:
     instrument = get_instrument(
-        symbol, timeout_seconds=timeout_seconds, retries=retries
+        symbol,
+        category,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
     )
     path = output_dir / f"{symbol}_{interval.label}.csv"
     with lock_csv(path):
         return _download_symbol_locked(
             symbol,
+            category,
             requested_start_ms,
             end_exclusive_ms,
             output_dir,
@@ -700,17 +724,29 @@ def download_symbol(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Download closed Last Traded Price candles for Bybit USDT "
-            "linear perpetuals and save Wealth-Lab-compatible CSV files."
+            "Download closed Last Traded Price candles for Bybit USDT spot "
+            "markets or linear perpetuals and save Wealth-Lab-compatible CSV "
+            "files."
         )
+    )
+    parser.add_argument(
+        "--category",
+        choices=("linear", "spot"),
+        default="linear",
+        help=(
+            "Bybit product category (default: linear). Use spot for spot-market "
+            "Last Traded Price candles."
+        ),
     )
     parser.add_argument(
         "--symbol",
         required=True,
         type=normalize_symbol,
         help=(
-            "One Bybit symbol to download. TradingView forms such as "
-            "BYBIT:BTCUSDT.P and 1000PEPEUSDT.P are accepted."
+            "One Bybit USDT symbol to download. TradingView forms such as "
+            "BYBIT:BTCUSDT.P and 1000PEPEUSDT.P are accepted for linear "
+            "contracts; use the actual spot symbol, such as PEPEUSDT, with "
+            "--category spot."
         ),
     )
     parser.add_argument(
@@ -816,7 +852,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output_dir.exists() and not args.output_dir.is_dir():
         parser.error(f"--output-dir is not a directory: {args.output_dir}")
 
-    print("Bybit source: linear USDT perpetual Last Traded Price klines")
+    source = (
+        "linear USDT perpetual"
+        if args.category == "linear"
+        else "USDT spot"
+    )
+    print(f"Bybit source: {source} Last Traded Price klines")
     print(f"Symbol: {symbol}")
     print(f"Interval: {interval.label} (Bybit API value: {interval.api_value})")
     print(f"Output: {args.output_dir.resolve()}")
@@ -825,6 +866,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = download_symbol(
             symbol,
+            args.category,
             start_ms,
             end_exclusive_ms,
             args.output_dir,

@@ -1,7 +1,9 @@
 # Bybit historical data for Wealth-Lab
 
 `wealthlab_downloader.py` downloads public Last Traded Price OHLCV bars
-for Bybit USDT linear perpetual contracts. It does not require an API key.
+for Bybit USDT linear perpetual contracts or USDT spot markets. It does not
+require an API key. Linear perpetuals remain the default for backward
+compatibility.
 
 The start date is a required input parameter. For a contract listed later,
 the downloader automatically starts at the Bybit launch time. One symbol is
@@ -14,6 +16,17 @@ Download or update one symbol:
 ```powershell
 python .\wealthlab_downloader.py --symbol BTCUSDT --start 2024-01-01
 ```
+
+Download Bybit spot candles by selecting the spot category and using the
+actual spot symbol:
+
+```powershell
+python .\wealthlab_downloader.py --category spot --symbol ETHUSDT --start 2024-01-01 --output-dir "..\Bybit Spot Data"
+```
+
+Leveraged-contract names are not spot symbols. For example, use `PEPEUSDT`,
+`FLOKIUSDT`, `BONKUSDT`, and `SHIBUSDT` for spot instead of their corresponding
+`1000...` perpetual names.
 
 The default interval is `1m`. Select another supported interval with
 `--interval`:
@@ -36,10 +49,12 @@ invalid interval before making an API request and displays the valid options.
 The downloader validates every command-line parameter and exits with a clear
 error instead of starting a download when an input is invalid:
 
+- `--category` must be `linear` or `spot`. The default is `linear`.
 - `--symbol` must have the form `ETHUSDT`, `1000PEPEUSDT`, or a TradingView
   form such as `BYBIT:1000PEPEUSDT.P`. Numeric prefixes such as `1000` are
-  accepted. The program then asks Bybit to confirm that it is an active USDT
-  linear perpetual.
+  accepted. The program then asks Bybit to confirm that it is an active market
+  in the selected category. Spot mode requires a USDT-quoted spot market;
+  linear mode requires a USDT-quoted and USDT-settled linear perpetual.
 - `--start` and `--end` must be real calendar dates in `YYYY-MM-DD` or
   ISO-8601 format. Future dates are rejected.
 - `--start` must precede `--end`, and the range must contain at least one
@@ -105,6 +120,7 @@ or 120-minute bars for the strategy backtests.
 
 ```text
 --start 2024-01-01       required UTC start
+--category linear        linear perpetual or spot (default: linear)
 --interval 1m            candle interval (default: 1m)
 --end 2026-01-01         exclusive UTC end
 --output-dir PATH        output directory
@@ -115,7 +131,6 @@ or 120-minute bars for the strategy backtests.
 --pause 0.05             pause between API requests
 ```
 
-Only fully closed candles are downloaded. The script validates that every
-symbol is an active `LinearPerpetual` quoted and settled in USDT, removes
-duplicates returned by the API, and reports missing selected intervals
-without inventing synthetic candles.
+Only fully closed candles are downloaded. The script validates the selected
+Bybit product category, removes duplicates returned by the API, and reports
+missing selected intervals without inventing synthetic candles.
